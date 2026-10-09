@@ -1,3 +1,25 @@
+<<<<<<< HEAD
 /build/
 /dist/
 /nbproject/private/
+=======
+# Java compiled output
+*.class
+
+# NetBeans build output
+/build/
+/dist/
+/nbproject/private/
+
+# Logs
+*.log
+
+# IDE and operating system files
+.DS_Store
+Thumbs.db
+
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+>>>>>>> f0cafc1bbbd5db584c221f555ded40bef10d0fb4
