@@ -1,0 +1,19 @@
+# Java compiled output
+*.class
+
+# NetBeans build output
+/build/
+/dist/
+/nbproject/private/
+
+# Logs
+*.log
+
+# IDE and operating system files
+.DS_Store
+Thumbs.db
+
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
