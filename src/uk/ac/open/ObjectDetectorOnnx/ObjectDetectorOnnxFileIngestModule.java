@@ -30,6 +30,7 @@ import java.util.Map;
 import java.util.logging.Level;
 import org.opencv.core.Core;
 import org.opencv.core.CvException;
+import org.opencv.core.CvType;
 import org.opencv.core.Mat;
 import org.opencv.core.MatOfByte;
 import org.opencv.core.MatOfFloat;
@@ -60,6 +61,7 @@ import org.sleuthkit.datamodel.BlackboardArtifact;
 import org.sleuthkit.datamodel.BlackboardAttribute;
 import org.sleuthkit.datamodel.Score;
 import org.sleuthkit.datamodel.TskCoreException;
+import org.sleuthkit.datamodel.TskData;
 
 /**
  * File ingest module that detects objects in images using ONNX object
@@ -76,8 +78,23 @@ public class ObjectDetectorOnnxFileIngestModule extends FileIngestModuleAdapter 
     private final static int MAX_FILE_SIZE = 100000000;  //Max size of pictures to perform object detection on
     private static final IngestModuleReferenceCounter refCounter = new IngestModuleReferenceCounter();
 
-    /** Square network input size (640 is the YOLOv5/v8/v11 default export). */
-    private static final int INPUT_SIZE = 640;
+    /**
+     * Input sizes {width, height} tried, in order, when working out what a
+     * model expects (640x640 is the YOLOv5/v8/v11 default export). Square sizes
+     * come first, then common rectangular exports.
+     */
+    private static final int[][] CANDIDATE_INPUT_SIZES = {
+        {640, 640}, {320, 320}, {416, 416}, {480, 480}, {512, 512}, {576, 576}, {608, 608},
+        {704, 704}, {768, 768}, {800, 800}, {960, 960}, {1024, 1024}, {1280, 1280},
+        {640, 480}, {480, 640}, {640, 384}, {384, 640}, {640, 352}, {352, 640},
+        {320, 240}, {240, 320}, {416, 320}, {320, 416}, {1280, 720}, {720, 1280}
+    };
+    /** Enough bytes for the longest signature checked (JPEG 2000: 8). */
+    private static final int HEADER_BYTES = 12;
+    /** Files smaller than this many bytes are not scanned. */
+    private static final long MIN_FILE_SIZE = 100;
+    /** Also accept anything Autopsy can create a thumbnail for. */
+    private static final boolean USE_THUMBNAIL_CHECK = true;
     private static final float CONFIDENCE_THRESHOLD = 0.35f;
     private static final float NMS_THRESHOLD = 0.45f;
 
@@ -86,10 +103,14 @@ public class ObjectDetectorOnnxFileIngestModule extends FileIngestModuleAdapter 
 
         final Net net;
         final List<String> labels;
+        final int inputWidth;
+        final int inputHeight;
 
-        OnnxModel(Net net, List<String> labels) {
+        OnnxModel(Net net, List<String> labels, int inputWidth, int inputHeight) {
             this.net = net;
             this.labels = labels;
+            this.inputWidth = inputWidth;
+            this.inputHeight = inputHeight;
         }
     }
 
@@ -128,7 +149,14 @@ public class ObjectDetectorOnnxFileIngestModule extends FileIngestModuleAdapter 
                                 logger.log(Level.WARNING, "ONNX model is empty: " + modelFile);
                                 continue;
                             }
-                            models.put(modelFile.getName(), new OnnxModel(net, loadLabels(modelFile)));
+                            int[] inputSize = resolveInputSize(net);
+                            if (inputSize == null) {
+                                logger.log(Level.WARNING, "Could not determine a supported input size for ONNX model " + modelFile);
+                                continue;
+                            }
+                            logger.log(Level.INFO, "Loaded ONNX model " + modelFile.getName()
+                                    + " with input size " + inputSize[0] + "x" + inputSize[1]);
+                            models.put(modelFile.getName(), new OnnxModel(net, loadLabels(modelFile), inputSize[0], inputSize[1]));
                         } catch (CvException ex) {
                             logger.log(Level.WARNING, "Unable to load ONNX model " + modelFile, ex);
                         }
@@ -148,6 +176,97 @@ public class ObjectDetectorOnnxFileIngestModule extends FileIngestModuleAdapter 
         } catch (NoCurrentCaseException ex) {
             throw new IngestModule.IngestModuleException("Exception while getting open case.", ex);
         }
+    }
+
+    /**
+     * Works out the input size a model accepts by running a blank image through
+     * it at each candidate size. Dynamic-shape models accept the first
+     * candidate (640x640); fixed-shape models reject every size but their own
+     * with a CvException, so the first size that runs cleanly is the one to use.
+     *
+     * @return {width, height}, or null if none of the candidates worked
+     */
+    private static int[] resolveInputSize(Net net) {
+        for (int[] candidate : CANDIDATE_INPUT_SIZES) {
+            int width = candidate[0];
+            int height = candidate[1];
+            Mat blank = Mat.zeros(height, width, CvType.CV_8UC3); // rows = height, cols = width
+            Mat blob = null;
+            List<Mat> outs = new ArrayList<>();
+            try {
+                blob = Dnn.blobFromImage(blank, 1.0 / 255.0, new Size(blank.cols(), blank.rows()), new Scalar(0, 0, 0), true, false);
+                net.setInput(blob);
+                net.forward(outs, net.getUnconnectedOutLayersNames());
+                if (!outs.isEmpty()) {
+                    return new int[]{width, height};
+                }
+            } catch (CvException ex) {
+                // wrong size for this model, try the next candidate
+            } finally {
+                blank.release();
+                if (blob != null) {
+                    blob.release();
+                }
+                for (Mat m : outs) {
+                    m.release();
+                }
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Decides whether to attempt detection on the file: it must be at least
+     * MIN_FILE_SIZE bytes and either be thumbnail-capable or start with a known
+     * image signature.
+     *
+     * @param file file to be checked
+     * @return true if the file should be scanned
+     */
+    private static boolean isImageFile(AbstractFile file) {
+        if (file.getSize() < MIN_FILE_SIZE) {
+            return false;
+        }
+
+        if (USE_THUMBNAIL_CHECK && ImageUtils.isImageThumbnailSupported(file)) {
+            return true;
+        }
+
+        byte[] header = new byte[HEADER_BYTES];
+        int bytesRead;
+        try {
+            bytesRead = file.read(header, 0, HEADER_BYTES);
+        } catch (TskCoreException ex) {
+            return false; // can't read the first few bytes: don't parse
+        }
+        if (bytesRead <= 0) {
+            return false;
+        }
+
+        // Signatures, most likely first. See
+        // http://www.garykessler.net/library/file_sigs.html
+        return startsWith(header, bytesRead, 0xFF, 0xD8, 0xFF)                              // JPEG
+                || startsWith(header, bytesRead, 0x42, 0x4D)                                // BMP "BM"
+                || startsWith(header, bytesRead, 0x89, 0x50, 0x4E, 0x47)                    // PNG (rest not checked)
+                || startsWith(header, bytesRead, 0x47, 0x49, 0x46, 0x38)                    // GIF87a / GIF89a
+                || startsWith(header, bytesRead, 0x49, 0x20, 0x49)                          // TIFF "I I"
+                || startsWith(header, bytesRead, 0x49, 0x49, 0x2A, 0x00)                    // TIFF little endian
+                || startsWith(header, bytesRead, 0x4D, 0x4D, 0x00, 0x2A)                    // TIFF big endian
+                || startsWith(header, bytesRead, 0x4D, 0x4D, 0x00, 0x2B)                    // BigTIFF
+                || startsWith(header, bytesRead, 0x00, 0x00, 0x00, 0x0C, 0x6A, 0x50, 0x20, 0x20); // JPEG 2000 (JP2)
+    }
+
+    /** @return true if the first sig.length bytes read match the signature */
+    private static boolean startsWith(byte[] buf, int bytesRead, int... sig) {
+        if (bytesRead < sig.length) {
+            return false;
+        }
+        for (int i = 0; i < sig.length; i++) {
+            if ((buf[i] & 0xFF) != sig[i]) {
+                return false;
+            }
+        }
+        return true;
     }
 
     /** Reads labels from model.names or model.txt next to the model, if present. */
@@ -178,7 +297,19 @@ public class ObjectDetectorOnnxFileIngestModule extends FileIngestModuleAdapter 
         "ObjectDetectorOnnxFileIngestModule.classifierDetection.text=Model detected {0} object(s): {1}"})
     @Override
     public ProcessResult process(AbstractFile file) {
-        if (models.isEmpty() || !ImageUtils.isImageThumbnailSupported(file)) {
+        if (models.isEmpty()) {
+            return IngestModule.ProcessResult.OK;
+        }
+
+        // Skip anything other than actual file system files.
+        if (file.getType() == TskData.TSK_DB_FILES_TYPE_ENUM.UNALLOC_BLOCKS
+                || file.getType() == TskData.TSK_DB_FILES_TYPE_ENUM.UNUSED_BLOCKS
+                || !file.isFile()) {
+            return IngestModule.ProcessResult.OK;
+        }
+
+        // Skip unsupported file types.
+        if (!isImageFile(file)) {
             return IngestModule.ProcessResult.OK;
         }
 
@@ -283,14 +414,16 @@ public class ObjectDetectorOnnxFileIngestModule extends FileIngestModuleAdapter 
     private static Map<String, Integer> detect(OnnxModel model, Mat image) {
         Map<String, Integer> counts = new LinkedHashMap<>();
 
-        // Letterbox to INPUT_SIZE x INPUT_SIZE, preserving aspect ratio.
+        // Letterbox to the model's input size, preserving aspect ratio.
+        final int inW = model.inputWidth;
+        final int inH = model.inputHeight;
         int w = image.cols();
         int h = image.rows();
-        double scale = Math.min((double) INPUT_SIZE / w, (double) INPUT_SIZE / h);
+        double scale = Math.min((double) inW / w, (double) inH / h);
         int newW = Math.max(1, (int) Math.round(w * scale));
         int newH = Math.max(1, (int) Math.round(h * scale));
-        int padX = (INPUT_SIZE - newW) / 2;
-        int padY = (INPUT_SIZE - newH) / 2;
+        int padX = (inW - newW) / 2;
+        int padY = (inH - newH) / 2;
 
         Mat resized = new Mat();
         Mat padded = new Mat();
@@ -304,9 +437,9 @@ public class ObjectDetectorOnnxFileIngestModule extends FileIngestModuleAdapter 
         MatOfInt keep = new MatOfInt();
         try {
             Imgproc.resize(image, resized, new Size(newW, newH));
-            Core.copyMakeBorder(resized, padded, padY, INPUT_SIZE - newH - padY, padX, INPUT_SIZE - newW - padX,
+            Core.copyMakeBorder(resized, padded, padY, inH - newH - padY, padX, inW - newW - padX,
                     Core.BORDER_CONSTANT, new Scalar(114, 114, 114));
-            blob = Dnn.blobFromImage(padded, 1.0 / 255.0, new Size(INPUT_SIZE, INPUT_SIZE), new Scalar(0, 0, 0), true, false);
+            blob = Dnn.blobFromImage(padded, 1.0 / 255.0, new Size(padded.cols(), padded.rows()), new Scalar(0, 0, 0), true, false);
 
             model.net.setInput(blob);
             model.net.forward(outputs, model.net.getUnconnectedOutLayersNames());
